@@ -5,10 +5,6 @@ import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import ta
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from io import BytesIO, StringIO
-from PIL import Image
 
 # ====================== 页面配置 ======================
 st.set_page_config(page_title="終極撈底系統", layout="wide", page_icon="📊")
@@ -200,36 +196,50 @@ def crash_risk_with_reasons():
         })
     return pd.DataFrame(out).sort_values("風險分數", ascending=False)
 
-def plot_volume_chart(df, ticker):
-    plt.style.use('default')
-    fig, ax = plt.subplots(figsize=(10, 4))
+# 🔧 用Plotly画成交量图，彻底告别matplotlib依赖！
+def plot_volume_chart_plotly(df, ticker):
+    df = df.reset_index()
+    recent_vol = df["Volume"].iloc[-1]
+    pct = percentile(df["Volume"].values, recent_vol)
+    mean_vol = np.mean(df["Volume"].values)
+    median_vol = np.median(df["Volume"].values)
     
-    dates = pd.to_datetime(df.index)
-    volumes = df["Volume"].values
-    recent = volumes[-1]
-    pct = percentile(volumes, recent)
+    fig = go.Figure()
+    # 成交量线
+    fig.add_trace(go.Scatter(
+        x=df["Date"], y=df["Volume"],
+        mode="lines", line=dict(color="#1f77b4", width=1),
+        name="成交量"
+    ))
+    # 均值线
+    fig.add_hline(y=mean_vol, line_dash="dash", line_color="gray",
+                  annotation_text=f"3年均值: {mean_vol:.0f}", annotation_position="top right")
+    # 中位数线
+    fig.add_hline(y=median_vol, line_dash="dash", line_color="orange",
+                  annotation_text=f"3年中位數: {median_vol:.0f}", annotation_position="top right")
+    # 今日成交量线
+    fig.add_vline(x=df["Date"].iloc[-1], line_color="red", line_width=2,
+                  annotation_text=f"今日: {recent_vol:.0f} ({pct}%)", annotation_position="top left")
     
-    ax.plot(dates, volumes, color='#1f77b4', alpha=0.6, linewidth=1)
-    ax.axhline(y=np.mean(volumes), color='gray', linestyle='--', alpha=0.5, label=f'3年均值: {np.mean(volumes):.0f}')
-    ax.axhline(y=np.median(volumes), color='orange', linestyle='--', alpha=0.5, label=f'3年中位數: {np.median(volumes):.0f}')
-    ax.axvline(x=dates[-1], color='red', linestyle='-', alpha=0.8, linewidth=2, label=f'今日成交量: {recent:.0f} ({pct}%)')
-    
-    ax.set_title(f'{ticker} 三年成交量走勢', fontsize=14)
-    ax.set_xlabel('日期', fontsize=12)
-    ax.set_ylabel('成交量', fontsize=12)
-    ax.legend(loc='upper right', fontsize=10)
-    ax.grid(True, alpha=0.3)
-    
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    plt.xticks(rotation=45)
-    
-    buf = BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-    buf.seek(0)
-    img = Image.open(buf)
-    return img
+    fig.update_layout(
+        title=f"{ticker} 三年成交量走勢",
+        xaxis_title="日期",
+        yaxis_title="成交量",
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        xaxis=dict(
+            rangeselector=dict(
+                buttons=list([
+                    dict(count=6, label="6月", step="month", stepmode="backward"),
+                    dict(count=1, label="1年", step="year", stepmode="backward"),
+                    dict(label="全部", step="all")
+                ])
+            ),
+            rangeslider=dict(visible=False),
+            type="date"
+        )
+    )
+    return fig
 
 # ====================== 介面 ======================
 st.title("📊 終極撈底預警系統")
@@ -367,8 +377,9 @@ elif mode == "成交量監測系統":
         if vol_df is None:
             st.error("無法獲取成交量數據")
         else:
-            img = plot_volume_chart(vol_df, code)
-            st.image(img, use_column_width=True)
+            # 用Plotly画，无依赖
+            fig = plot_volume_chart_plotly(vol_df, code)
+            st.plotly_chart(fig, use_container_width=True)
             
             recent_vol = vol_df["Volume"].iloc[-1]
             pct = percentile(vol_df["Volume"].values, recent_vol)
