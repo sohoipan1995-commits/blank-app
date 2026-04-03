@@ -5,6 +5,10 @@ import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import ta
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from io import BytesIO, StringIO
+from PIL import Image
 
 # ====================== 页面配置 ======================
 st.set_page_config(page_title="終極撈底系統", layout="wide", page_icon="📊")
@@ -30,6 +34,16 @@ def get_data(ticker, period="2y"):
     except:
         return None
 
+@st.cache_data(ttl=3600)
+def get_volume_data(ticker):
+    try:
+        df = yf.Ticker(ticker).history(period="3y")
+        if df.empty: return None
+        df.index = df.index.tz_localize(None)
+        return df[["Volume"]].round(2)
+    except:
+        return None
+
 def percentile(arr, x):
     arr = np.array(arr)
     return round(np.sum(arr < x) / len(arr) * 100, 1)
@@ -44,7 +58,7 @@ def volume_state(df):
     if ratio >= 4: typ, txt = "error", f"🔴 劇烈放量 | "+txt
     elif ratio <= 0.6: typ, txt = "success", f"🟢 地量 | "+txt
     elif ratio >=2: typ, txt = "warning", f"🟠 放量 | "+txt
-    return pct, txt, typ
+    return pct, txt, typ, ratio
 
 def fib_levels(df):
     high = df["High"].max()
@@ -68,14 +82,49 @@ def price_levels_fine(df):
         levels.append({"跌幅":f"-{p}%","價位":px,"狀態":"已跌破" if now<=px else "未跌破"})
     return pd.DataFrame(levels)
 
-def gann_pivots(df):
+def bottom_score(df):
+    c = df.Close.iloc[-1]
+    rsi = ta.momentum.rsi(df.Close, 14).iloc[-1]
+    stoch = ta.momentum.stoch(df.High, df.Low, df.Close).iloc[-1]
+    bb = ta.volatility.BollingerBands(df.Close)
+    bb_lower = bb.bollinger_lband().iloc[-1]
+    ma200 = df.Close.rolling(200).mean().iloc[-1]
+    
+    score = 0
+    reasons = []
+    if rsi < 30: score += 30; reasons.append("RSI<30 (超賣)")
+    if stoch < 20: score += 25; reasons.append("隨機指標<20 (超賣)")
+    if c < bb_lower: score += 20; reasons.append("跌破布林帶下軌")
+    if c < ma200 * 0.85: score += 25; reasons.append("低於200日線15%")
+    
+    rating = "強烈建議撈底" if score >= 80 else "建議觀望" if score >= 50 else "不建議撈底"
+    color = "success" if score >= 80 else "warning" if score >= 50 else "error"
+    return score, rating, color, reasons
+
+def gann_pivots_two_year(df):
     df["h60"] = df["High"].rolling(60, center=True).max()
     df["l60"] = df["Low"].rolling(60, center=True).min()
     hp = df[df.High==df.h60].reset_index()[["Date","High"]].rename(columns={"Date":"日期","High":"價位"}).assign(類型="高點")
     lp = df[df.Low==df.l60].reset_index()[["Date","Low"]].rename(columns={"Date":"日期","Low":"價位"}).assign(類型="低點")
-    return pd.concat([lp,hp]).sort_values("日期", ascending=False).reset_index(drop=True)
+    piv = pd.concat([lp,hp]).sort_values("日期", ascending=False).reset_index(drop=True)
+    
+    # 過濾重要高低點（基於價格波動幅度）
+    if len(piv) > 20:
+        df_close = df["Close"].iloc[-730:].dropna().values
+        avg_vol = np.mean(np.abs(np.diff(df_close)))
+        filtered = []
+        for i, r in piv.iterrows():
+            if i == 0:
+                filtered.append(r)
+                continue
+            prev_price = filtered[-1]["價位"]
+            current_price = r["價位"]
+            if abs(current_price - prev_price) > avg_vol * 5:
+                filtered.append(r)
+        piv = pd.DataFrame(filtered)
+    return piv
 
-def gann_dates(piv):
+def gann_dates_with_importance(piv):
     res = []
     now = datetime.now()
     limit = now + timedelta(days=180)
@@ -83,12 +132,22 @@ def gann_dates(piv):
         for c in GANN_CYCLES:
             d = r["日期"] + timedelta(days=c)
             if now < d <= limit:
-                res.append({"轉勢日":d.strftime("%Y-%m-%d"),"週期":f"{c}日","來源":r["類型"]})
+                importance = 0
+                if c in [60,90,120,180]: importance += 2
+                if r["類型"] == "高點": importance += 1
+                res.append({
+                    "轉勢日":d.strftime("%Y-%m-%d"),
+                    "週期":f"{c}日",
+                    "來源":r["類型"],
+                    "重要性":importance,
+                    "原因":f"{c}日週期是江恩重要週期" if c in [60,90,120,180] else f"{c}日週期"
+                })
     df = pd.DataFrame(res)
     if df.empty: return df
-    cnt = df.groupby("轉勢日").size().to_frame("共振")
+    cnt = df.groupby("轉勢日").agg({"重要性":"sum","週期":lambda x: ",".join(x),"來源":lambda x: ",".join(x),"原因":lambda x: ",".join(x)}).rename(columns={"重要性":"共振分數"})
     df = df.merge(cnt, on="轉勢日")
-    df = df.sort_values(["共振","轉勢日"], ascending=[False,True])
+    df = df.sort_values(["共振分數","轉勢日"], ascending=[False,True])
+    df["重要性評級"] = df["共振分數"].apply(lambda x: "⭐⭐⭐ 極高" if x >=5 else "⭐⭐ 高" if x >=3 else "⭐ 中")
     return df.drop_duplicates("轉勢日")
 
 def plot_gann_candle(df, dates):
@@ -98,25 +157,83 @@ def plot_gann_candle(df, dates):
     fig.update_layout(height=420, xaxis_rangeslider_visible=False)
     return fig
 
-def crash_risk():
+def crash_risk_with_reasons():
     today = datetime.now()
     out = []
     for i in range(1, 181):
         d = today + timedelta(days=i)
-        m, day = d.month, d.day
+        m, day, wd = d.month, d.day, d.weekday()
         s = 0
-        if m in (3,6,9,12) and day>20: s+=35
-        if day>25: s+=20
-        if d.weekday()>=4: s+=15
-        if m in (1,2,9,10): s+=25
-        if day%7==0 or day%10==0: s+=10
+        reasons = []
+        
+        # 季末效應 (3,6,9,12月20日後)
+        if m in (3,6,9,12) and day>20:
+            s += 35
+            reasons.append("季末流動性緊張")
+        
+        # 月尾效應 (25日後)
+        if day>25:
+            s += 20
+            reasons.append("月尾結算壓力")
+        
+        # 周末效應 (週四/五)
+        if wd >=4:
+            s += 15
+            reasons.append("周末避險情緒")
+        
+        # 月份風險
+        if m in (1,2,9,10):
+            s += 25
+            reasons.append("歷史高波動月份")
+        
+        # 特殊日期
+        if day%7==0 or day%10==0:
+            s += 10
+            reasons.append("江恩週期關鍵日")
+        
         lev = "🔴 高風險" if s>=50 else "🟡 中風險" if s>=30 else "🟢 低風險"
-        out.append({"日期":d.strftime("%Y-%m-%d"),"風險":lev,"風險分數":s})
+        out.append({
+            "日期":d.strftime("%Y-%m-%d"),
+            "風險":lev,
+            "風險分數":s,
+            "主要原因":", ".join(reasons) if reasons else "無特殊風險因素"
+        })
     return pd.DataFrame(out).sort_values("風險分數", ascending=False)
+
+def plot_volume_chart(df, ticker):
+    plt.style.use('default')
+    fig, ax = plt.subplots(figsize=(10, 4))
+    
+    dates = pd.to_datetime(df.index)
+    volumes = df["Volume"].values
+    recent = volumes[-1]
+    pct = percentile(volumes, recent)
+    
+    ax.plot(dates, volumes, color='#1f77b4', alpha=0.6, linewidth=1)
+    ax.axhline(y=np.mean(volumes), color='gray', linestyle='--', alpha=0.5, label=f'3年均值: {np.mean(volumes):.0f}')
+    ax.axhline(y=np.median(volumes), color='orange', linestyle='--', alpha=0.5, label=f'3年中位數: {np.median(volumes):.0f}')
+    ax.axvline(x=dates[-1], color='red', linestyle='-', alpha=0.8, linewidth=2, label=f'今日成交量: {recent:.0f} ({pct}%)')
+    
+    ax.set_title(f'{ticker} 三年成交量走勢', fontsize=14)
+    ax.set_xlabel('日期', fontsize=12)
+    ax.set_ylabel('成交量', fontsize=12)
+    ax.legend(loc='upper right', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    plt.xticks(rotation=45)
+    
+    buf = BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format='png', dpi=300, bbox_inches='tight')
+    buf.seek(0)
+    img = Image.open(buf)
+    return img
 
 # ====================== 介面 ======================
 st.title("📊 終極撈底預警系統")
-st.caption("永久網站版｜江恩K線｜黃金分割｜大跌風險｜監控清單記憶")
+st.caption("永久網站版｜江恩K線｜黃金分割｜大跌風險｜監控清單記憶｜成交量監測")
 
 with st.sidebar:
     mode = st.radio("功能模組", [
@@ -124,7 +241,8 @@ with st.sidebar:
         "多股監控清單(記憶)",
         "江恩轉勢日 + K線",
         "未來半年大跌風險",
-        "撈底評分排行榜"
+        "撈底評分排行榜",
+        "成交量監測系統"
     ])
 
 # -------------------- 個股分析 --------------------
@@ -138,8 +256,9 @@ if mode == "個股綜合分析":
             hh = df.High.max()
             ll = df.Low.min()
             drop = round((hh-c)/hh*100,1)
-            vp, vt, vtp = volume_state(df)
+            vp, vt, vtp, vr = volume_state(df)
             fib = fib_levels(df)
+            score, rating, color, reasons = bottom_score(df)
 
             col1,col2,col3,col4 = st.columns(4)
             col1.metric("現價", c)
@@ -152,6 +271,10 @@ if mode == "個股綜合分析":
 
             st.subheader("📈 黃金分割支撐壓力")
             st.dataframe(pd.DataFrame([fib]).T, use_container_width=True)
+
+            st.subheader("🎯 撈底評分系統")
+            st.markdown(f"**評分:** {score}/100 | **建議:** <span style='color:{color}'>{rating}</span>", unsafe_allow_html=True)
+            st.write("評分依據: " + ", ".join(reasons))
 
 # -------------------- 多股監控(記憶) --------------------
 elif mode == "多股監控清單(記憶)":
@@ -170,22 +293,37 @@ elif mode == "多股監控清單(記憶)":
         c = df.Close.iloc[-1]
         hh = df.High.max()
         drop = round((hh-c)/hh*100,1)
-        with st.expander(f"{code} | 現價 {c} | 跌幅 {drop}%", expanded=True):
-            st.dataframe(price_levels_fine(df), use_container_width=True)
+        fib = fib_levels(df)
+        score, rating, color, reasons = bottom_score(df)
+        
+        with st.expander(f"{code} | 現價 {c} | 跌幅 {drop}% | 撈底評分 {score}/100", expanded=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("📈 黃金分割支撐")
+                st.dataframe(pd.DataFrame([fib]).T, use_container_width=True)
+            
+            with col2:
+                st.subheader("📉 精細跌幅位")
+                st.dataframe(price_levels_fine(df), use_container_width=True)
+            
+            st.subheader("🎯 撈底建議")
+            st.markdown(f"**建議:** <span style='color:{color}'>{rating}</span>", unsafe_allow_html=True)
+            st.write("評分理由: " + ", ".join(reasons))
 
 # -------------------- 江恩 + K線 --------------------
 elif mode == "江恩轉勢日 + K線":
     idx_name = st.selectbox("指數", list(INDEX_POOL.keys()))
-    df = get_data(INDEX_POOL[idx_name], period="5y")
+    df = get_data(INDEX_POOL[idx_name], period="2y")  # 只取兩年數據
     if df is not None:
-        piv = gann_pivots(df)
-        gd = gann_dates(piv)
+        piv = gann_pivots_two_year(df)
+        gd = gann_dates_with_importance(piv)
 
-        st.subheader("重要高低點")
+        st.subheader("重要高低點 (兩年內)")
         st.dataframe(piv, use_container_width=True)
 
-        st.subheader("未來半年轉勢日")
-        st.dataframe(gd, use_container_width=True)
+        st.subheader("未來半年轉勢日 (含重要性)")
+        gd_display = gd[["轉勢日","共振分數","重要性評級","週期","來源","原因"]]
+        st.dataframe(gd_display, use_container_width=True)
 
         st.subheader("K線圖 + 紅線標註轉勢日")
         date_list = pd.to_datetime(gd["轉勢日"]).tolist() if not gd.empty else []
@@ -193,8 +331,8 @@ elif mode == "江恩轉勢日 + K線":
 
 # -------------------- 大跌風險 --------------------
 elif mode == "未來半年大跌風險":
-    st.subheader("📉 未來半年高機率大跌日期 (每日更新)")
-    risk_df = crash_risk()
+    st.subheader("📉 未來半年高機率大跌日期 (含詳細原因)")
+    risk_df = crash_risk_with_reasons()
     st.dataframe(risk_df, use_container_width=True)
     st.info("🔴 高風險請減倉｜系統基於10年週期、季末、月尾、節奏統計")
 
@@ -206,18 +344,45 @@ elif mode == "撈底評分排行榜":
     for code in all_codes:
         df = get_data(code)
         if df is None: continue
-        close = df.Close.iloc[-1]
+        c = df.Close.iloc[-1]
         hh = df.High.max()
-        drop = round((hh-close)/hh*100,1)
-        rsi = ta.momentum.rsi(df.Close, 14).iloc[-1]
-        score = 0
-        if rsi < 30: score += 30
-        if close < df.Close.rolling(200).mean().iloc[-1] * 0.85: score += 25
-        if ta.momentum.stoch(df.High, df.Low, df.Close).iloc[-1] < 20: score += 25
-        if close < ta.volatility.BollingerBands(df.Close).bollinger_lband().iloc[-1]: score += 20
-        result.append({"代碼":code,"撈底評分":score,"現價":close,"較高點跌幅":f"{drop}%"})
+        drop = round((hh-c)/hh*100,1)
+        score, rating, color, reasons = bottom_score(df)
+        result.append({
+            "代碼":code,
+            "撈底評分":score,
+            "建議":rating,
+            "現價":c,
+            "較高點跌幅":f"{drop}%"
+        })
     rank_df = pd.DataFrame(result).sort_values("撈底評分", ascending=False)
     st.dataframe(rank_df, use_container_width=True)
+
+# -------------------- 成交量監測 --------------------
+elif mode == "成交量監測系統":
+    st.subheader("📊 成交量監測 (三年數據)")
+    code = st.text_input("輸入股票代碼")
+    if code and st.button("分析成交量"):
+        vol_df = get_volume_data(code)
+        if vol_df is None:
+            st.error("無法獲取成交量數據")
+        else:
+            img = plot_volume_chart(vol_df, code)
+            st.image(img, use_column_width=True)
+            
+            recent_vol = vol_df["Volume"].iloc[-1]
+            pct = percentile(vol_df["Volume"].values, recent_vol)
+            ratio = recent_vol / np.mean(vol_df["Volume"].tail(5).values) if np.mean(vol_df["Volume"].tail(5).values) > 0 else 1
+            
+            st.subheader("成交量分析結果")
+            if ratio >= 4:
+                st.error(f"🔴 劇烈放量: 成交量是近期均值的{ratio:.1f}倍，處於三年{int(pct)}百分位")
+            elif ratio <= 0.6:
+                st.success(f"🟢 地量: 成交量是近期均值的{ratio:.1f}倍，處於三年{int(pct)}百分位")
+            elif ratio >= 2:
+                st.warning(f"🟠 放量: 成交量是近期均值的{ratio:.1f}倍，處於三年{int(pct)}百分位")
+            else:
+                st.info(f"📊 正常量: 成交量是近期均值的{ratio:.1f}倍，處於三年{int(pct)}百分位")
 
 st.divider()
 st.caption("© 終極撈底系統 · 永久網址版")
